@@ -144,6 +144,11 @@ dmypy.json
 **/outputs/skyseg.onnx
 skyseg.onnx
 
+# Gradio temporary files
+.gradio/
+input_images_*/
+test_ffmpeg_output/
+
 # pixi environments
 .pixi
 *.egg-info

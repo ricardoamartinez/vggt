@@ -5,12 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-import cv2
 import torch
 import numpy as np
 import gradio as gr
 import sys
 import shutil
+import subprocess
 from datetime import datetime
 import glob
 import gc
@@ -139,22 +139,59 @@ def handle_uploads(input_video, input_images):
         else:
             video_path = input_video
 
-        vs = cv2.VideoCapture(video_path)
-        fps = vs.get(cv2.CAP_PROP_FPS)
-        frame_interval = int(fps * 1)  # 1 frame/sec
-
-        count = 0
-        video_frame_num = 0
-        while True:
-            gotit, frame = vs.read()
-            if not gotit:
-                break
-            count += 1
-            if count % frame_interval == 0:
-                image_path = os.path.join(target_dir_images, f"{video_frame_num:06}.png")
-                cv2.imwrite(image_path, frame)
-                image_paths.append(image_path)
-                video_frame_num += 1
+        print(f"Extracting frames from video: {video_path}")
+        
+        # Use FFmpeg for fast frame extraction (1 frame per second)
+        try:
+            # FFmpeg command to extract 1 frame per second
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-i", video_path,
+                "-vf", "fps=1",  # Extract 1 frame per second
+                "-y",  # Overwrite output files
+                "-loglevel", "warning",  # Reduce log verbosity
+                os.path.join(target_dir_images, "%06d.png")
+            ]
+            
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+            
+            # Get the extracted image paths
+            extracted_images = sorted(glob.glob(os.path.join(target_dir_images, "*.png")))
+            image_paths.extend(extracted_images)
+            
+            print(f"Extracted {len(extracted_images)} frames using FFmpeg")
+            
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg failed: {e}")
+            print(f"FFmpeg stderr: {e.stderr}")
+            
+            # Fallback to basic FFmpeg command if the first fails
+            try:
+                print("Trying fallback FFmpeg extraction...")
+                # Clear any partial files
+                for f in glob.glob(os.path.join(target_dir_images, "*.png")):
+                    os.remove(f)
+                    
+                # Simpler FFmpeg command
+                fallback_cmd = [
+                    "ffmpeg",
+                    "-i", video_path,
+                    "-r", "1",  # 1 frame per second
+                    "-y",
+                    os.path.join(target_dir_images, "frame_%06d.png")
+                ]
+                
+                subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+                extracted_images = sorted(glob.glob(os.path.join(target_dir_images, "*.png")))
+                image_paths.extend(extracted_images)
+                print(f"Fallback extraction successful: {len(extracted_images)} frames")
+                
+            except subprocess.CalledProcessError as e2:
+                print(f"Fallback FFmpeg also failed: {e2}")
+                raise ValueError(f"Video processing failed. Please ensure FFmpeg is installed. Error: {e2.stderr}")
+        
+        except FileNotFoundError:
+            raise ValueError("FFmpeg not found. Please install FFmpeg to process videos.")
 
     # Sort final images for gallery
     image_paths = sorted(image_paths)
