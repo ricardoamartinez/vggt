@@ -107,7 +107,19 @@ def predictions_to_glb(
                     "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
                 )
 
-            for i, image_name in enumerate(image_list):
+            # Only process images that correspond to the frames used by the model
+            # If frame skipping was applied, we need to match the same subset
+            actual_num_frames = S  # This is the number of frames actually processed
+            if len(image_list) != actual_num_frames:
+                # Frame skipping was applied, calculate which frames to process
+                frame_skip = len(image_list) // actual_num_frames
+                selected_indices = list(range(0, len(image_list), frame_skip))[:actual_num_frames]
+            else:
+                # No frame skipping, process all frames
+                selected_indices = list(range(len(image_list)))
+
+            for idx in selected_indices:
+                image_name = image_list[idx]
                 image_filepath = os.path.join(target_dir_images, image_name)
                 mask_filepath = os.path.join(target_dir, "sky_masks", image_name)
 

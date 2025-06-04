@@ -41,7 +41,7 @@ model = model.to(device)
 # -------------------------------------------------------------------------
 # 1) Core model inference
 # -------------------------------------------------------------------------
-def run_model(target_dir, model) -> dict:
+def run_model(target_dir, model, frame_skip=1) -> dict:
     """
     Run the VGGT model on images in the 'target_dir/images' folder and return predictions.
     """
@@ -59,7 +59,14 @@ def run_model(target_dir, model) -> dict:
     # Load and preprocess images
     image_names = glob.glob(os.path.join(target_dir, "images", "*"))
     image_names = sorted(image_names)
-    print(f"Found {len(image_names)} images")
+    
+    # Apply frame skipping
+    if frame_skip > 1:
+        image_names = image_names[::frame_skip]
+        print(f"Found {len(glob.glob(os.path.join(target_dir, 'images', '*')))} total images, using every {frame_skip} frames ({len(image_names)} selected)")
+    else:
+        print(f"Found {len(image_names)} images")
+    
     if len(image_names) == 0:
         raise ValueError("No images found. Check your upload.")
 
@@ -71,7 +78,7 @@ def run_model(target_dir, model) -> dict:
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
+        with torch.amp.autocast('cuda', dtype=dtype):
             predictions = model(images)
 
     # Convert pose encoding to extrinsic and intrinsic matrices
@@ -141,57 +148,180 @@ def handle_uploads(input_video, input_images):
 
         print(f"Extracting frames from video: {video_path}")
         
-        # Use FFmpeg for fast frame extraction (1 frame per second)
+        # Step 1: Convert problematic videos to standard MP4 first
+        converted_video_path = video_path
+        
+        # Check if video needs conversion (GoPro, incomplete uploads, etc.)
         try:
-            # FFmpeg command to extract 1 frame per second
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-i", video_path,
-                "-vf", "fps=1",  # Extract 1 frame per second
-                "-y",  # Overwrite output files
-                "-loglevel", "warning",  # Reduce log verbosity
-                os.path.join(target_dir_images, "%06d.png")
+            # Quick test to see if the video can be read properly
+            test_cmd = ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", video_path]
+            result = subprocess.run(test_cmd, capture_output=True, text=True, check=True, timeout=10)
+            
+            if not result.stdout.strip() or result.stdout.strip() == "N/A":
+                print("Video appears corrupted or incomplete, attempting conversion...")
+                needs_conversion = True
+            else:
+                print(f"Video duration: {result.stdout.strip()}s")
+                needs_conversion = False
+                
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            print("Could not probe video, attempting conversion...")
+            needs_conversion = True
+        
+        # Convert to standard MP4 if needed
+        if needs_conversion:
+            print("Converting video to standard MP4 format...")
+            converted_video_path = os.path.join(target_dir, "converted_video.mp4")
+            
+            # Try multiple conversion approaches for maximum compatibility
+            conversion_methods = [
+                # Method 1: Standard conversion with faststart
+                [
+                    "ffmpeg", "-i", video_path,
+                    "-c:v", "libx264", "-c:a", "aac", 
+                    "-movflags", "+faststart", "-y", "-loglevel", "warning",
+                    converted_video_path
+                ],
+                # Method 2: More aggressive conversion ignoring errors
+                [
+                    "ffmpeg", "-err_detect", "ignore_err", "-i", video_path,
+                    "-c:v", "libx264", "-c:a", "aac",
+                    "-movflags", "+faststart", "-y", "-loglevel", "warning",
+                    converted_video_path
+                ],
+                # Method 3: Force format and ignore timestamps
+                [
+                    "ffmpeg", "-fflags", "+genpts+igndts", "-i", video_path,
+                    "-c:v", "libx264", "-c:a", "aac",
+                    "-movflags", "+faststart", "-y", "-loglevel", "warning",
+                    converted_video_path
+                ],
+                # Method 4: Copy streams without re-encoding (fastest)
+                [
+                    "ffmpeg", "-i", video_path,
+                    "-c", "copy", "-movflags", "+faststart",
+                    "-y", "-loglevel", "warning",
+                    converted_video_path
+                ],
+                # Method 5: Aggressive repair with re-encoding
+                [
+                    "ffmpeg", "-err_detect", "ignore_err", "-fflags", "+genpts",
+                    "-i", video_path, "-c:v", "libx264", "-preset", "ultrafast",
+                    "-crf", "28", "-c:a", "aac", "-movflags", "+faststart",
+                    "-y", "-loglevel", "warning", converted_video_path
+                ]
             ]
             
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+            conversion_successful = False
             
-            # Get the extracted image paths
-            extracted_images = sorted(glob.glob(os.path.join(target_dir_images, "*.png")))
-            image_paths.extend(extracted_images)
+            for i, cmd in enumerate(conversion_methods):
+                try:
+                    print(f"Trying conversion method {i+1}...")
+                    # Remove any partial conversion file
+                    if os.path.exists(converted_video_path):
+                        os.remove(converted_video_path)
+                    
+                    subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=180)
+                    
+                    # Verify the converted file exists and has content
+                    if os.path.exists(converted_video_path) and os.path.getsize(converted_video_path) > 1024:
+                        print(f"Video conversion method {i+1} successful!")
+                        video_path = converted_video_path
+                        conversion_successful = True
+                        break
+                    else:
+                        print(f"Conversion method {i+1} produced empty file")
+                        
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    print(f"Conversion method {i+1} failed: {e}")
+                    continue
             
-            print(f"Extracted {len(extracted_images)} frames using FFmpeg")
-            
-        except subprocess.CalledProcessError as e:
-            print(f"FFmpeg failed: {e}")
-            print(f"FFmpeg stderr: {e.stderr}")
-            
-            # Fallback to basic FFmpeg command if the first fails
+            if not conversion_successful:
+                print("All conversion methods failed, attempting direct frame extraction with original video...")
+                # Continue with original video
+        
+        # Step 2: Extract frames from video (original or converted)
+        extraction_successful = False
+        
+        # List of FFmpeg commands to try, ordered by compatibility  
+        ffmpeg_methods = [
+            # Method 1: GoPro specific with all bypass flags
+            [
+                "ffmpeg", "-fflags", "+genpts+igndts+ignidx+discardcorrupt", 
+                "-err_detect", "ignore_err", "-i", video_path,
+                "-vf", "fps=1", "-f", "image2", "-y", "-v", "error",
+                os.path.join(target_dir_images, "frame_%06d.png")
+            ],
+            # Method 2: Force format with maximum tolerance
+            [
+                "ffmpeg", "-f", "mov,mp4,m4a,3gp,3g2,mj2", 
+                "-fflags", "+genpts+igndts", "-analyzeduration", "100M", 
+                "-probesize", "100M", "-i", video_path,
+                "-vf", "fps=1", "-f", "image2", "-y", "-v", "error",
+                os.path.join(target_dir_images, "frame_%06d.png")
+            ],
+            # Method 3: Raw stream copy approach
+            [
+                "ffmpeg", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+                "-i", video_path, "-vf", "fps=1", "-f", "image2", "-y", "-v", "error",
+                os.path.join(target_dir_images, "frame_%06d.png")
+            ],
+            # Method 4: Force seek to start and extract
+            [
+                "ffmpeg", "-ss", "0", "-fflags", "+genpts+discardcorrupt",
+                "-i", video_path, "-t", "3600", "-r", "1", "-f", "image2", 
+                "-y", "-v", "error", os.path.join(target_dir_images, "frame_%06d.png")
+            ],
+            # Method 5: Maximum aggressive extraction
+            [
+                "ffmpeg", "-thread_queue_size", "1024", "-fflags", "+genpts+igndts+ignidx+discardcorrupt+nofillin+noparse",
+                "-err_detect", "ignore_err", "-i", video_path,
+                "-vf", "fps=1", "-f", "image2", "-y", "-v", "error",
+                os.path.join(target_dir_images, "frame_%06d.png")
+            ],
+            # Method 6: Standard extraction (fallback)
+            [
+                "ffmpeg", "-i", video_path, "-vf", "fps=1", "-y", 
+                "-loglevel", "error", os.path.join(target_dir_images, "%06d.png")
+            ]
+        ]
+        
+        for i, cmd in enumerate(ffmpeg_methods):
             try:
-                print("Trying fallback FFmpeg extraction...")
-                # Clear any partial files
+                print(f"Trying FFmpeg method {i+1}...")
+                # Clear any partial files from previous attempts
                 for f in glob.glob(os.path.join(target_dir_images, "*.png")):
                     os.remove(f)
-                    
-                # Simpler FFmpeg command
-                fallback_cmd = [
-                    "ffmpeg",
-                    "-i", video_path,
-                    "-r", "1",  # 1 frame per second
-                    "-y",
-                    os.path.join(target_dir_images, "frame_%06d.png")
-                ]
                 
-                subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                
+                # Check if any images were extracted
                 extracted_images = sorted(glob.glob(os.path.join(target_dir_images, "*.png")))
-                image_paths.extend(extracted_images)
-                print(f"Fallback extraction successful: {len(extracted_images)} frames")
+                if len(extracted_images) > 0:
+                    image_paths.extend(extracted_images)
+                    print(f"FFmpeg method {i+1} successful: {len(extracted_images)} frames extracted")
+                    extraction_successful = True
+                    break
+                else:
+                    print(f"FFmpeg method {i+1} ran but no frames extracted")
                 
-            except subprocess.CalledProcessError as e2:
-                print(f"Fallback FFmpeg also failed: {e2}")
-                raise ValueError(f"Video processing failed. Please ensure FFmpeg is installed. Error: {e2.stderr}")
+            except subprocess.CalledProcessError as e:
+                print(f"FFmpeg method {i+1} failed with exit code {e.returncode}")
+                continue
+            except FileNotFoundError:
+                print("FFmpeg not found, skipping remaining FFmpeg methods")
+                break
         
-        except FileNotFoundError:
-            raise ValueError("FFmpeg not found. Please install FFmpeg to process videos.")
+        if not extraction_successful:
+            error_msg = (
+                f"Video processing failed for {os.path.basename(video_path)}. "
+                "This may be due to:\n"
+                "1. Unsupported video codec or container format\n"
+                "2. Corrupted video file\n"
+                "3. Missing FFmpeg installation\n\n"
+                "Please try converting the video to a standard MP4 format first."
+            )
+            raise ValueError(error_msg)
 
     # Sort final images for gallery
     image_paths = sorted(image_paths)
@@ -228,6 +358,7 @@ def gradio_demo(
     show_cam=True,
     mask_sky=False,
     prediction_mode="Pointmap Regression",
+    frame_skip=1,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
@@ -247,7 +378,7 @@ def gradio_demo(
 
     print("Running run_model...")
     with torch.no_grad():
-        predictions = run_model(target_dir, model)
+        predictions = run_model(target_dir, model, frame_skip)
 
     # Save predictions
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
@@ -510,6 +641,7 @@ with gr.Blocks(
             with gr.Row():
                 conf_thres = gr.Slider(minimum=0, maximum=100, value=50, step=0.1, label="Confidence Threshold (%)")
                 frame_filter = gr.Dropdown(choices=["All"], value="All", label="Show Points from Frame")
+                frame_skip = gr.Slider(minimum=1, maximum=10, value=1, step=1, label="Frame Skip (use every Nth frame)")
                 with gr.Column():
                     show_cam = gr.Checkbox(label="Show Camera", value=True)
                     mask_sky = gr.Checkbox(label="Filter Sky", value=False)
@@ -595,6 +727,7 @@ with gr.Blocks(
             show_cam,
             mask_sky,
             prediction_mode,
+            frame_skip,
         ],
         outputs=[reconstruction_output, log_output, frame_filter],
     ).then(
